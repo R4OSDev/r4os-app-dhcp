@@ -1,25 +1,36 @@
 ﻿DHCP.R4X
 ========
 
-DHCP.R4X ist das Terminalwerkzeug fuer DHCP-Aktionen wie Acquire, Renew,
-Release und Status.
+DHCP fuehrt Acquire, Renew, Release und Status ueber den bestehenden DHCPv4-Dienst aus.
 
-Projektstruktur seit 0.51.19:
-- `build.zig` baut die App als eigenes SDK-Projekt.
-- `build.zig.zon` bindet `r4os_sdk` als Paket.
-- `module.R4MF` beschreibt Artefakt, Zielpfad, Imports und Contract.
+API-Migration0.90.69
+-------------------
 
-Build unter Windows und Linux:
+Der normale Build verwendet SDK0.64.202, Contract0.64.93 und App2.
+SDK_PROFILE=r4os-zig-generation2 waehlt R4XStart2 und Query2.
+Die geordneten Importe folgen module.R4MF.
+
+    R4SYS:Query2:2
+    R4NET:Query2:2
+
+Ganze Argumente werden mit dem gemeinsamen ArgCursor geprueft. Der Standard
+ist ACQUIRE. REQUEST, RENEW, RELEASE, STATUS und STAT behalten ihre Bedeutung.
+Der kopierte DHCPSVC-Vertrag wird ueber die Query2-Servicefassade verwendet.
+Ein absolutes Clockbudget umfasst Aktion und Status. Die private Aktion
+erhaelt eine Deadline im kanonischen Tickkoordinatensystem. Unbestaetigte
+Aktionen werden mit Fehlercode ausgegeben. Nach einem verlorenen ACK
+beendet der Verbraucher die Operation. Ein fehlender Dienst oder ein
+defekter Status liefert ausdruecklich einen unbekannten Leasezustand.
+
+Build im jeweiligen Repository
+-------------------------------
 
     Build.bat
     ./Build.sh
 
-Ergebnis:
+Die duennen Hoststarter fuehren gemeinsame PowerShell7-Logik aus.
+Settings.R4S ordnet die lokalen Besitzer zu. build.zig.zon pinnt den
+Standalone-Satz. Das Manifest besitzt Version, Klasse, Ziel und Abhaengigkeiten.
 
     Artifacts/Modules/Dhcp/DHCP.R4X
-
-Contract:
-- R4XStart-Entry: `r4_app_main`
-- App-Klasse: `console`
-- Platform-API-Imports: `R4SYS`, `R4NET`
-- Zielpfad im Image: `C:\R4OS\SOFTWARE\TERMINAL\DHCP.R4X`
+    C:\R4OS\SOFTWARE\TERMINAL\DHCP.R4X

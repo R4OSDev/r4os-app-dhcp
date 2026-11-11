@@ -1,3 +1,4 @@
+const std = @import("std");
 const r4os = @import("r4os");
 
 const Action = enum {
@@ -11,15 +12,11 @@ const App = struct {
     sys: r4os.r4sys.Context,
     net: r4os.r4net.Context,
 
-    fn init(r4_app: *r4os.App) ?App {
+    fn init(r4_app: *r4os.App2) ?App {
         return .{
             .sys = r4_app.system(),
             .net = r4_app.networkLowLevel() orelse return null,
         };
-    }
-
-    fn argsRaw(self: *const App) [*:0]const u8 {
-        return self.sys.argsRaw();
     }
 
     fn write(self: *const App, value: []const u8) void {
@@ -34,64 +31,77 @@ const App = struct {
         self.sys.printU64(value);
     }
 
-    fn netDhcpAcquireService(self: *const App) i32 {
-        return self.net.netDhcpAcquireService();
-    }
-
-    fn netDhcpRenewService(self: *const App) i32 {
-        return self.net.netDhcpRenewService();
-    }
-
-    fn netDhcpReleaseService(self: *const App) i32 {
-        return self.net.netDhcpReleaseService();
-    }
-
-    fn netDhcpServiceStatus(self: *const App, out: *r4os.abi.DhcpStatus) i32 {
-        return self.net.netDhcpServiceStatus(out);
-    }
-
     fn netTxResultName(self: *const App, result: i32) []const u8 {
         return self.net.netTxResultName(result);
     }
 };
 
-pub fn r4_app_main(r4_app: *r4os.App) i32 {
+pub fn r4_app_main(r4_app: *r4os.App2) i32 {
     const ctx = App.init(r4_app) orelse return r4os.abi.err_no_group;
-    const args = trim(zSlice(ctx.argsRaw()));
-    const action = parseAction(args) orelse {
+    var failure: r4os.arguments.Failure = .{};
+    var cursor = r4_app.argCursor(.{ .switches = 0 }, &failure) catch {
         usage(&ctx);
         return 1;
     };
-
-    var result: i32 = r4os.abi.net_tx_ok;
-    switch (action) {
-        .acquire => {
-            result = ctx.netDhcpAcquireService();
-            ctx.write("DHCP live acquire: ");
-            ctx.write(ctx.netTxResultName(result));
-            ctx.write("\r\n");
-        },
-        .renew => {
-            result = ctx.netDhcpRenewService();
-            ctx.write("DHCP renew: ");
-            ctx.write(ctx.netTxResultName(result));
-            ctx.write("\r\n");
-        },
-        .release => {
-            result = ctx.netDhcpReleaseService();
-            ctx.write("DHCP release: ");
-            ctx.write(ctx.netTxResultName(result));
-            ctx.write("\r\n");
-        },
-        .status => {},
-    }
-
-    var status: r4os.abi.DhcpStatus = .{};
-    if (ctx.netDhcpServiceStatus(&status) <= 0) {
-        ctx.write("DHCP status: unavailable\r\n");
+    const token = cursor.next() catch return 1;
+    const argument = if (token) |value| value.bytes(r4_app.args()) catch return 1 else "";
+    const action = parseAction(argument) orelse {
+        usage(&ctx);
+        return 1;
+    };
+    if ((cursor.next() catch return 1) != null) {
+        usage(&ctx);
         return 1;
     }
-    printStatus(&ctx, status);
+    const clock = r4_app.clock() catch return r4os.abi.err_no_fn;
+    var budget = r4os.rpc_budget.Budget.fromTimeout(clock.read, .{ .kind = r4os.abi.timeout_kind_finite, .nanoseconds = 5_000_000_000 }) catch |err| return r4os.rpc_budget.code(err);
+    var client: r4os.network_family.Dhcp = undefined;
+    const opened = r4os.network_family.Dhcp.open(ctx.sys, &client);
+    if (opened != 0) {
+        ctx.write("DHCP status: unavailable (unknown lease)\r\n");
+        return 1;
+    }
+    const result = run(&ctx, action, &client, &budget);
+    if (client.close() < 0) {
+        ctx.write("DHCP connection close unconfirmed\r\n");
+        return 1;
+    }
+    return result;
+}
+
+fn run(ctx: *const App, action: Action, client: *r4os.network_family.Dhcp, budget: *r4os.rpc_budget.Budget) i32 {
+    var result: i32 = r4os.abi.net_tx_ok;
+    if (action != .status) {
+        const op: u16 = switch (action) {
+            .acquire => r4os.abi.net_service_op_dhcp_acquire_result,
+            .renew => r4os.abi.net_service_op_dhcp_renew_result,
+            .release => r4os.abi.net_service_op_dhcp_release_result,
+            .status => unreachable,
+        };
+        var response: r4os.abi.NetServiceDhcpResult = .{};
+        const rc = client.action(op, budget, &response);
+        if (rc != 0) {
+            ctx.write("DHCP action unconfirmed, code=");
+            ctx.sys.printI32(rc);
+            ctx.write("\r\n");
+            return 1;
+        }
+        result = response.result;
+        ctx.write(switch (action) {
+            .acquire => "DHCP live acquire: ",
+            .renew => "DHCP renew: ",
+            .release => "DHCP release: ",
+            .status => unreachable,
+        });
+        ctx.write(ctx.netTxResultName(result));
+        ctx.write("\r\n");
+    }
+    var status: r4os.abi.NetServiceDhcpStatus = .{};
+    if (client.status(budget, &status) != 0) {
+        ctx.write("DHCP status: unavailable (unknown lease)\r\n");
+        return 1;
+    }
+    printStatus(ctx, status);
     return if (result == r4os.abi.net_tx_ok) 0 else 1;
 }
 
@@ -108,18 +118,18 @@ fn usage(ctx: *const App) void {
     ctx.write("Usage: DHCP [ACQUIRE|RENEW|RELEASE|STATUS]\r\n");
 }
 
-fn printStatus(ctx: *const App, status: r4os.abi.DhcpStatus) void {
+fn printStatus(ctx: *const App, status: r4os.abi.NetServiceDhcpStatus) void {
     ctx.write("DHCP status\r\n");
     ctx.write("State . . . . . . . . . . : ");
     ctx.write(dhcpRuntimeStateName(status.runtime_state));
     ctx.write("\r\n");
 
     ctx.write("Mode/Task/Link . . . . . . : ");
-    ctx.write(if ((status.flags & r4os.abi.dhcp_status_flag_desired) != 0) "dhcp" else "static");
+    ctx.write(if ((status.flags & r4os.abi.net_service_dhcp_flag_desired) != 0) "dhcp" else "static");
     ctx.write("/");
-    ctx.write(if ((status.flags & r4os.abi.dhcp_status_flag_task_started) != 0) "running" else "stopped");
+    ctx.write(if ((status.flags & r4os.abi.net_service_dhcp_flag_task_started) != 0) "running" else "stopped");
     ctx.write("/");
-    ctx.write(if ((status.flags & r4os.abi.dhcp_status_flag_link_up) != 0) "up" else "down");
+    ctx.write(if ((status.flags & r4os.abi.net_service_dhcp_flag_link_up) != 0) "up" else "down");
     ctx.write("\r\n");
 
     ctx.write("Client IP . . . . . . . . : ");
@@ -135,7 +145,7 @@ fn printStatus(ctx: *const App, status: r4os.abi.DhcpStatus) void {
     writeIpv4(ctx, status.gateway_ip);
     ctx.write("\r\n");
     ctx.write("DNS Server . . . . . . . . : ");
-    if ((status.flags & r4os.abi.dhcp_status_flag_dns_configured) != 0) {
+    if ((status.flags & r4os.abi.net_service_dhcp_flag_dns_configured) != 0) {
         writeIpv4(ctx, status.dns_ip);
     } else {
         ctx.write("not configured");
@@ -246,34 +256,6 @@ fn spanZ(value: []const u8) []const u8 {
     return value[0..end];
 }
 
-fn zSlice(ptr: [*:0]const u8) []const u8 {
-    var len: usize = 0;
-    while (ptr[len] != 0) : (len += 1) {}
-    return ptr[0..len];
-}
-
-fn trim(value: []const u8) []const u8 {
-    var start: usize = 0;
-    var end = value.len;
-    while (start < end and isSpace(value[start])) : (start += 1) {}
-    while (end > start and isSpace(value[end - 1])) : (end -= 1) {}
-    return value[start..end];
-}
-
-fn isSpace(ch: u8) bool {
-    return ch == ' ' or ch == '\t' or ch == '\r' or ch == '\n';
-}
-
 fn equalsIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    var index: usize = 0;
-    while (index < a.len) : (index += 1) {
-        if (asciiUpper(a[index]) != asciiUpper(b[index])) return false;
-    }
-    return true;
-}
-
-fn asciiUpper(ch: u8) u8 {
-    if (ch >= 'a' and ch <= 'z') return ch - 32;
-    return ch;
+    return std.ascii.eqlIgnoreCase(a, b);
 }
